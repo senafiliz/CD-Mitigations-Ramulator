@@ -147,16 +147,21 @@ class SALTCCODAE : public IControllerPlugin, public Implementation {
                 refresh_due_subarray(flat_bank);
         }
 
+        // RFMab and REFab act only on the banks of the addressed rank.
         if (req.command == m_RFMab_id) {
-            for (int b=0; b < m_cfg.m_num_banks; b++){
-                refresh_due_subarray(b);
+            int rank = req.addr_vec[m_cfg.m_rank_level];
+            int bpr = m_cfg.m_num_banks_per_rank;
+            for (int b = 0; b < bpr; b++){
+                refresh_due_subarray(rank * bpr + b);
             }
             s_saltc_RFMab_commands++;
         }
 
         if(req.command == m_REFab_id){
-            for (int b = 0; b < m_cfg.m_num_banks; b++){
-                ref_coordinate(b);
+            int rank = req.addr_vec[m_cfg.m_rank_level];
+            int bpr = m_cfg.m_num_banks_per_rank;
+            for (int b = 0; b < bpr; b++){
+                ref_coordinate(rank * bpr + b);
             }
         }
 
