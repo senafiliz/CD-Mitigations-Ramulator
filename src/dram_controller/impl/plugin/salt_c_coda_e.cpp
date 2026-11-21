@@ -44,6 +44,19 @@ class SALTCCODAE : public IControllerPlugin, public Implementation {
         int m_pac_max = -1;
         bool m_is_debug = false;
 
+        // Warmup: the controller issues no RFMs, so the back-off is emulated
+        // on this plugin's own counters (same as salt_c.cpp).
+        enum class Shadow { IDLE, WAIT, DELAY };
+        Shadow m_shadow = Shadow::IDLE;
+        bool m_shadow_trigger = false;
+        Clk_t m_clk = 0;
+        Clk_t m_shadow_start = 0;
+        int m_shadow_delay_rem = 0;
+        int m_abo_act_ns = 180;
+        int m_abo_cycles = -1;
+        int m_recovery_refs = 1;
+        int m_delay_acts = 4;
+
         struct SubarrayState {
             int actr = 0;
             int rptr = 0;
@@ -78,6 +91,8 @@ class SALTCCODAE : public IControllerPlugin, public Implementation {
         m_subarray_size = param<int>("subarray_size").desc("Rows per subarray").required();
         m_pac_bits = param<int>("pac_bits").desc("Bits allocated to the CODA-E Pending-Activation Counter").default_val(4);
         m_is_debug = param<bool>("debug").default_val(false);
+        m_abo_act_ns = param<int>("abo_act_ns").default_val(180);
+        m_delay_acts = param<int>("abo_delay_acts").default_val(4);
     }
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
@@ -93,6 +108,7 @@ class SALTCCODAE : public IControllerPlugin, public Implementation {
         m_RFMab_id = m_dram->m_commands("RFMab");
 
         m_REFab_id = m_dram->m_commands("REFab");
+        m_abo_cycles = m_abo_act_ns / ((float)m_dram->m_timing_vals("tCK_ps") / 1000.0f);
         m_rows_per_ref = rows_per_bank / 8192;
         if (m_rows_per_ref < 1) m_rows_per_ref = 1;
         m_rr_sa.resize(m_cfg.m_num_banks);
@@ -109,6 +125,13 @@ class SALTCCODAE : public IControllerPlugin, public Implementation {
         if (!m_prac){
             throw ConfigurationError("[SALTCCODAE] requires a PRAC plugin for ABO-based refresh.");
         }
+        m_recovery_refs = m_prac->get_num_abo_recovery_refs();
+        // Keep PRAC recovering while a bank's selected subarray is at or above ATH.
+        m_prac->set_pending_work_fn([this]() -> bool {
+            for (int b = 0; b < m_cfg.m_num_banks; b++)
+                if (css_pending(b)) return true;
+            return false;
+        });
 
         m_state.resize(m_cfg.m_num_banks);
         m_css.resize(m_cfg.m_num_banks);
@@ -125,10 +148,41 @@ class SALTCCODAE : public IControllerPlugin, public Implementation {
     }
 
     void update(bool request_found, ReqBuffer::iterator& req_it) override{
-        if (!request_found)
-            return;
+        m_clk++;
         bool warmup_active = m_frontend && !m_frontend->is_warmup_done();
-        auto& req = *req_it;
+        bool delay_ended = false;
+        if (!warmup_active) m_shadow = Shadow::IDLE;
+        else if (m_shadow == Shadow::WAIT && m_clk >= m_shadow_start) shadow_recovery();
+        m_shadow_trigger = false;
+
+        if (request_found) {
+            process(*req_it);
+            bool is_act = m_dram->m_command_meta(req_it->command).is_opening &&
+                          m_dram->m_command_scopes(req_it->command) == m_row_level;
+            if (warmup_active && is_act && m_shadow == Shadow::DELAY && --m_shadow_delay_rem == 0) {
+                m_shadow = Shadow::IDLE;
+                delay_ended = true;
+            }
+        }
+
+        if (warmup_active && m_shadow == Shadow::IDLE) {
+            bool any_pending = false;
+            for (int b = 0; b < m_cfg.m_num_banks && !any_pending; b++) any_pending = css_pending(b);
+            if (delay_ended ? any_pending : m_shadow_trigger) {
+                m_shadow = Shadow::WAIT;
+                m_shadow_start = m_clk + (delay_ended ? 1 : 0) + m_abo_cycles;
+            }
+        }
+        m_shadow_trigger = false;
+    }
+
+
+    private:
+    bool css_pending(int flat_bank) const {
+        return m_css[flat_bank].valid && m_css[flat_bank].actr >= m_ath;
+    }
+
+    void process(Request& req){
 
         if (m_dram->m_command_meta(req.command).is_opening &&
             m_dram->m_command_scopes(req.command) == m_row_level) {
@@ -142,9 +196,6 @@ class SALTCCODAE : public IControllerPlugin, public Implementation {
 
             aci_increment(flat_bank, sa - 1);
             aci_increment(flat_bank, sa + 1);
-
-            if (warmup_active && m_css[flat_bank].valid && m_css[flat_bank].actr >= m_ath)
-                refresh_due_subarray(flat_bank);
         }
 
         if (req.command == m_RFMab_id) {
@@ -162,8 +213,17 @@ class SALTCCODAE : public IControllerPlugin, public Implementation {
 
     }
 
+    // Warmup-only emulation of one PRAC back-off: abo_recovery_refs RFMab per
+    // rank, then abo_delay_acts ACTs before a new ALERT.
+    void shadow_recovery(){
+        int bpr = m_cfg.m_num_banks_per_rank;
+        for (int i = 0; i < m_recovery_refs; i++)
+            for (int r = 0; r < m_cfg.m_num_ranks; r++)
+                for (int b = 0; b < bpr; b++) refresh_due_subarray(r * bpr + b);
+        m_shadow = Shadow::DELAY;
+        m_shadow_delay_rem = m_delay_acts;
+    }
 
-    private:
     void count_and_check(int flat_bank, int sa){
         if (sa < 0 || sa >= m_num_subarrays) return;
         auto& st = m_state[flat_bank][sa];
@@ -177,8 +237,11 @@ class SALTCCODAE : public IControllerPlugin, public Implementation {
 
         }
         if (st.actr >= m_ath){
-            m_prac->set_abo_needed(
-                true, IPRAC::ABOTrigger::SALTC, flat_bank);
+            if (m_frontend && !m_frontend->is_warmup_done())
+                m_shadow_trigger = true;
+            else
+                m_prac->set_abo_needed(
+                    true, IPRAC::ABOTrigger::SALTC, flat_bank);
             s_saltc_ath_events++;
             if (m_is_debug)
                 std::printf("[SALTC CODA-E] ATH CROSS bank=%d sa=%d actr=%d >= ath=%d -> ABO\n",
