@@ -187,13 +187,13 @@ class SALTCCODAE : public IControllerPlugin, public Implementation {
     }
 
     // CODA-E: neighbor propagation goes through PAC instead of a direct
-    // ACTR increment. Only when PAC would overflow do we spill one real
-    // ACTR increment onto the neighbor.
+    // ACTR increment. When the PAC is full, the increment bypasses it and
+    // goes to the neighbor's real ACTR; the PAC stays full, so the pending
+    // increments it holds are not lost.
     void aci_increment(int flat_bank, int sa){
         if (sa < 0 || sa >= m_num_subarrays) return;
         auto& st = m_state[flat_bank][sa];
         if (st.pac + 1 > m_pac_max){
-            st.pac = 0;
             s_coda_e_pac_spillover_events++;
             count_and_check(flat_bank, sa);
             if (m_is_debug)
