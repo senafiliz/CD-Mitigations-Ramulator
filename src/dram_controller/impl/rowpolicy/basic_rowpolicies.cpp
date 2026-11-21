@@ -28,7 +28,8 @@ class CloseRowPolicy : public IRowPolicy, public Implementation {
   private:
     IDRAM* m_dram;
     
-    int m_PRE_req_id = -1;
+    int m_PRE_cmd = -1;
+    int m_RD_cmd = -1;
     
     int m_cap = -1;
     int m_aqua_copy_read_id =-1;
@@ -46,6 +47,19 @@ class CloseRowPolicy : public IRowPolicy, public Implementation {
 
     std::vector<uint64_t> m_col_accesses;
 
+    // Rows that reached the cap and still have to be closed, per flat bank
+    // (empty = nothing to close). The PRE is issued in a command slot where the
+    // controller issues nothing else. Sending it through priority_send() would
+    // block all other requests until the PRE can issue (tRTP/tWR/tRAS).
+    std::vector<AddrVec_t> m_to_close;
+    std::vector<int> m_marked;   // flat bank ids with a pending close
+    size_t m_rr = 0;
+
+    void reset_bank(int flat_bank_id) {
+      m_col_accesses[flat_bank_id] = 0;
+      m_to_close[flat_bank_id].clear();   // dropped from m_marked lazily
+    }
+
   public:
     void init() override { };
 
@@ -61,7 +75,8 @@ class CloseRowPolicy : public IRowPolicy, public Implementation {
       m_bank_level = m_dram->m_levels("bank");
       m_row_level = m_dram->m_levels("row");
 
-      m_PRE_req_id = m_dram->m_requests("close-row");
+      m_PRE_cmd = m_dram->m_commands("PRE");
+      m_RD_cmd = m_dram->m_commands("RD");
       m_aqua_copy_read_id = m_dram->m_requests("aqua-copy-read");
       m_aqua_copy_write_id = m_dram->m_requests("aqua-copy-write");
 
@@ -72,14 +87,17 @@ class CloseRowPolicy : public IRowPolicy, public Implementation {
       m_num_banks = m_dram->get_level_size("bank");
       
       m_col_accesses.resize(m_num_banks * m_num_bankgroups * m_num_ranks, 0);
+      m_to_close.resize(m_num_banks * m_num_bankgroups * m_num_ranks);
 
       register_stat(s_num_close_reqs).name("num_close_reqs");
     };
 
     void update(bool request_found, ReqBuffer::iterator& req_it) override {
 
-      if (!request_found)
+      if (!request_found) {
+        close_in_idle_slot();
         return;
+      }
 
       if (m_dram->m_command_meta(req_it->command).is_closing ||
           m_dram->m_command_meta(req_it->command).is_refreshing)  // PRE or REF 
@@ -90,7 +108,7 @@ class CloseRowPolicy : public IRowPolicy, public Implementation {
             for (int bg = 0; bg < m_num_bankgroups; bg++) {
               int rank_id = req_it->addr_vec[m_rank_level];
               int flat_bank_id = b + bg * m_num_banks + rank_id * m_num_banks * m_num_bankgroups;
-              m_col_accesses[flat_bank_id] = 0;
+              reset_bank(flat_bank_id);
             }
           }
         } else if (req_it->addr_vec[m_bankgroup_level] == -1) {  // same bank closes
@@ -98,14 +116,14 @@ class CloseRowPolicy : public IRowPolicy, public Implementation {
             int bank_id = req_it->addr_vec[m_bank_level];
             int rank_id = req_it->addr_vec[m_rank_level];
             int flat_bank_id = bank_id + bg * m_num_banks + rank_id * m_num_banks * m_num_bankgroups;
-            m_col_accesses[flat_bank_id] = 0;
+            reset_bank(flat_bank_id);
           }
         } else {  // single bank closes  (PRE, VRR, RDA, WRA)
           int flat_bank_id = req_it->addr_vec[m_bank_level] + 
                              req_it->addr_vec[m_bankgroup_level] * m_num_banks + 
                              req_it->addr_vec[m_rank_level] * m_num_banks * m_num_bankgroups;
 
-          m_col_accesses[flat_bank_id] = 0;
+          reset_bank(flat_bank_id);
         }
       } else if (m_dram->m_command_meta(req_it->command).is_accessing)  // RD or WR
       {
@@ -119,13 +137,36 @@ class CloseRowPolicy : public IRowPolicy, public Implementation {
         m_col_accesses[flat_bank_id]++;
 
         if (m_col_accesses[flat_bank_id] >= m_cap) {
-          Request req(req_it->addr_vec, m_PRE_req_id);
-          m_ctrl->priority_send(req);
+          if (m_to_close[flat_bank_id].empty()) m_marked.push_back(flat_bank_id);
+          m_to_close[flat_bank_id] = req_it->addr_vec;
           m_col_accesses[flat_bank_id] = 0;
-          s_num_close_reqs++;
         }
       }
     };
+
+  private:
+    // Issue at most one PRE, for a marked bank whose row is still open and ready to close.
+    void close_in_idle_slot() {
+      for (size_t n = 0; n < m_marked.size(); ) {
+        size_t i = (m_rr + n) % m_marked.size();
+        int fb = m_marked[i];
+        AddrVec_t& av = m_to_close[fb];
+        if (av.empty() || !m_dram->check_rowbuffer_hit(m_RD_cmd, av)) {
+          av.clear();                         // reset, or the row was closed by another command
+          m_marked.erase(m_marked.begin() + i);
+          continue;                           // re-check the element shifted into i
+        }
+        if (m_dram->check_ready(m_PRE_cmd, av)) {
+          m_dram->issue_command(m_PRE_cmd, av);
+          s_num_close_reqs++;
+          av.clear();
+          m_marked.erase(m_marked.begin() + i);
+          m_rr = m_marked.empty() ? 0 : i % m_marked.size();
+          return;
+        }
+        n++;
+      }
+    }
 };
 
 }       // namespace Ramulator
