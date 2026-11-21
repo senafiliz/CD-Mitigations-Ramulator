@@ -67,6 +67,7 @@ target_sources(
   
   impl/plugin/prac.cpp
   impl/plugin/prac.h
+  impl/plugin/silver_bullet_core.h
 
   impl/plugin/chronus.cpp
   impl/plugin/abo_breakhammer_bridge.cpp
