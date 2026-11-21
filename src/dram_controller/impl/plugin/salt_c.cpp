@@ -47,6 +47,19 @@ class SALTC : public IControllerPlugin, public Implementation {
         int m_recovery_refs = 1;
         int m_delay_acts = 4;
 
+        // Back-off after an ALERT:
+        //   prac    (default): the IPRAC plugin's own back-off, e.g. PRAC's
+        //                      abo_recovery_refs RFMs per ALERT.
+        //   chronus          : RFMs until no bank's selected subarray (CSS) is
+        //                      at or above ATH. Needs the Chronus plugin (with
+        //                      its RowHammer threshold off) placed after SALTC.
+        //                      Each RFM here adds bundle counts to its subarray
+        //                      and to each neighbor, so RFMs drain the counters
+        //                      only if apm > 3 * bundle (apm > bundle without
+        //                      neighbor_propagation); otherwise recovery never ends.
+        bool m_backoff_chronus = false;
+        int m_chronus_max_rounds = 100000;
+
         struct SubarrayState {
             int actr = 0;
             int rptr = 0;
@@ -65,6 +78,7 @@ class SALTC : public IControllerPlugin, public Implementation {
         int s_saltc_RFMab_refreshes = 0;
         int s_saltc_RFMab_commands = 0;
         int s_saltc_ath_events = 0;
+        int s_saltc_max_actr = 0;
 
 
     public:
@@ -77,6 +91,11 @@ class SALTC : public IControllerPlugin, public Implementation {
         m_is_debug = param<bool>("debug").default_val(false);
         m_abo_act_ns = param<int>("abo_act_ns").default_val(180);
         m_delay_acts = param<int>("abo_delay_acts").default_val(4);
+        std::string backoff = param<std::string>("backoff").desc("prac | chronus").default_val("prac");
+        if (backoff != "prac" && backoff != "chronus")
+            throw ConfigurationError("[SALTC] backoff must be prac or chronus, got {}", backoff);
+        m_backoff_chronus = (backoff == "chronus");
+        m_chronus_max_rounds = param<int>("chronus_max_rounds").desc("Warmup cap on RFM rounds per back-off (backoff: chronus)").default_val(100000);
     }
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
@@ -108,6 +127,8 @@ class SALTC : public IControllerPlugin, public Implementation {
         if (!m_prac){
             throw ConfigurationError("[SALTC] requires a PRAC plugin for ABO-based refresh.");
         }
+        if (m_backoff_chronus && dynamic_cast<Implementation*>(m_prac)->get_name() != "Chronus")
+            throw ConfigurationError("[SALTC] backoff: chronus requires the Chronus plugin.");
         m_recovery_refs = m_prac->get_num_abo_recovery_refs();
         m_prac->set_pending_work_fn([this]() -> bool {
             for (int b = 0; b < m_cfg.m_num_banks; b++)
@@ -122,6 +143,7 @@ class SALTC : public IControllerPlugin, public Implementation {
         register_stat(s_saltc_RFMab_refreshes).name("saltc_row_refreshes_in_RFM_command (total count of ranks)");
         register_stat(s_saltc_RFMab_commands).name("saltc_RFM_commands");
         register_stat(s_saltc_ath_events).name("saltc_ath_events");
+        register_stat(s_saltc_max_actr).name("saltc_max_actr");
 
 
     }
@@ -199,17 +221,32 @@ class SALTC : public IControllerPlugin, public Implementation {
     void shadow_recovery(){
         if (m_is_debug) std::printf("[SALTV] SHADOW-RECOVERY clk=%lu\n", (unsigned long)m_clk);
         int bpr = m_cfg.m_num_banks_per_rank;
-        for (int i = 0; i < m_recovery_refs; i++)
+        auto one_round = [&]() {
             for (int r = 0; r < m_cfg.m_num_ranks; r++)
                 for (int b = 0; b < bpr; b++) refresh_due_subarray(r * bpr + b);
+        };
+        if (m_backoff_chronus) {
+            // Chronus: RFMs until nothing is pending, no post-recovery delay.
+            for (int i = 0; i < m_chronus_max_rounds && any_css_pending(); i++) one_round();
+            m_shadow = Shadow::IDLE;
+            return;
+        }
+        for (int i = 0; i < m_recovery_refs; i++) one_round();
         m_shadow = Shadow::DELAY;
         m_shadow_delay_rem = m_delay_acts;
+    }
+
+    bool any_css_pending() const {
+        for (int b = 0; b < m_cfg.m_num_banks; b++)
+            if (css_pending(b)) return true;
+        return false;
     }
 
     void count_and_check(int flat_bank, int sa){
         if (sa < 0 || sa >= m_num_subarrays) return;
         auto& st = m_state[flat_bank][sa];
         st.actr++;
+        if (st.actr > s_saltc_max_actr) s_saltc_max_actr = st.actr;
 
         auto& css = m_css[flat_bank];
         if(!css.valid || st.actr > css.actr){
