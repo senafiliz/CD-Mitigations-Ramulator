@@ -258,10 +258,9 @@ class SALTCCODAE : public IControllerPlugin, public Implementation {
 
         for (int k = 0; k < m_rows_per_ref; k++){
             int sa = (rr + k) % m_num_subarrays;
-            auto it = bank.find(sa);
-            if (it == bank.end()) continue;
-            auto& st = it->second;
-            if (st.actr <= 0) continue;
+            // The REF refreshes the RPtr row of this subarray whatever its
+            // counter value, so RPtr must advance even when ACTR is 0.
+            auto& st = bank[sa];
 
             int per_dec = ((st.rptr + 1) * m_apm / m_bundle) - (st.rptr * m_apm / m_bundle);
             st.rptr = (st.rptr + 1) % m_subarray_size;
