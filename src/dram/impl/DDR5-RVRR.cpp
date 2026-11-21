@@ -464,11 +464,12 @@ class DDR5RVRR : public IDRAM, public Implementation {
         }
       }(m_timing_vals("rate"));
 
+      // JEDEC JESD79-5: tRRD_L = max(8 nCK, 5 ns) = 8 nCK at 3200 MT/s
       constexpr int nRRDL_TABLE[3][1] = {
       // 3200  
-        { 5, },  // x4
-        { 5, },  // x8
-        { 5, },  // x16
+        { 8, },  // x4
+        { 8, },  // x8
+        { 8, },  // x16
       };
       constexpr int nFAW_TABLE[3][1] = {
       // 3200  

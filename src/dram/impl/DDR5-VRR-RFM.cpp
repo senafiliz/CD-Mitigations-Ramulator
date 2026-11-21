@@ -478,7 +478,8 @@ private:
     }(m_timing_vals("rate"));
 
     // nRRDL and nFAW (not provided by the preset; derived from DQ width)
-    constexpr int nRRDL_TABLE[3][1] = {{ 5 }, { 5 }, { 5 }};   // x4, x8, x16
+    // JEDEC JESD79-5: tRRD_L = max(8 nCK, 5 ns) = 8 nCK at 3200 MT/s
+    constexpr int nRRDL_TABLE[3][1] = {{ 8 }, { 8 }, { 8 }};   // x4, x8, x16
     constexpr int nFAW_TABLE[3][1]  = {{ 40 }, { 32 }, { 32 }}; // x4, x8, x16
     if (dq_id != -1 && rate_id != -1) {
       m_timing_vals("nRRDL") = nRRDL_TABLE[dq_id][rate_id];
